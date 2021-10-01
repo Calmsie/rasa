@@ -4,21 +4,25 @@ import logging
 from typing import List, Text, Optional, Dict, Any, TYPE_CHECKING
 
 import aiohttp
+
 import rasa.core
-from rasa.core.constants import DEFAULT_REQUEST_TIMEOUT
 from rasa.core.policies.policy import PolicyPrediction
+
+from rasa.shared.core import events
+from rasa.core.constants import DEFAULT_REQUEST_TIMEOUT
+
 from rasa.nlu.constants import (
     RESPONSE_SELECTOR_DEFAULT_INTENT,
     RESPONSE_SELECTOR_PROPERTY_NAME,
     RESPONSE_SELECTOR_PREDICTION_KEY,
     RESPONSE_SELECTOR_UTTER_ACTION_KEY,
 )
+
 from rasa.shared.constants import (
     DOCS_BASE_URL,
     DEFAULT_NLU_FALLBACK_INTENT_NAME,
     UTTER_PREFIX,
 )
-from rasa.shared.core import events
 from rasa.shared.core.constants import (
     USER_INTENT_OUT_OF_SCOPE,
     ACTION_LISTEN_NAME,
@@ -33,7 +37,8 @@ from rasa.shared.core.constants import (
     ACTION_BACK_NAME,
     REQUESTED_SLOT,
 )
-from rasa.shared.core.domain import Domain
+from rasa.shared.exceptions import RasaException
+from rasa.shared.nlu.constants import INTENT_NAME_KEY, INTENT_RANKING_KEY
 from rasa.shared.core.events import (
     UserUtteranceReverted,
     UserUttered,
@@ -45,10 +50,10 @@ from rasa.shared.core.events import (
     Restarted,
     SessionStarted,
 )
-from rasa.shared.exceptions import RasaException
-from rasa.shared.nlu.constants import INTENT_NAME_KEY, INTENT_RANKING_KEY
 from rasa.shared.utils.schemas.events import EVENTS_SCHEMA
 from rasa.utils.endpoints import EndpointConfig, ClientResponseError
+from rasa.shared.core.domain import Domain
+
 
 if TYPE_CHECKING:
     from rasa.shared.core.trackers import DialogueStateTracker
@@ -275,6 +280,27 @@ class ActionBotResponse(Action):
         domain: "Domain",
     ) -> List[Event]:
         """Simple run implementation uttering a (hopefully defined) response."""
+        def split_message_into_blocs(
+            message: Dict[Text, Any],
+            utter_action: Text
+            ):
+            message_text = message.get("text", None)
+            if message_text is None:
+                return [create_bot_utterance(message)]
+
+            text_split = message_text.split('\n\n')
+            bot_utterances = []
+            for text in text_split[:-1]:
+                bot_utterances.append(
+                    create_bot_utterance({
+                        "text": text,
+                        "utter_action": utter_action
+                        }))
+
+            message["text"] = text_split[-1]
+            bot_utterances.append(create_bot_utterance(message))
+            return bot_utterances
+
         message = await nlg.generate(self.utter_action, tracker, output_channel.name())
         if message is None:
             if not self.silent_fail:
@@ -285,7 +311,7 @@ class ActionBotResponse(Action):
             return []
         message["utter_action"] = self.utter_action
 
-        return [create_bot_utterance(message)]
+        return split_message_into_blocs(message, self.utter_action)
 
     def name(self) -> Text:
         """Returns action name."""
@@ -354,44 +380,6 @@ class ActionRetrieveResponse(ActionBotResponse):
         """Resolve the name of the intent from the action name."""
         return action_name.split(UTTER_PREFIX)[1]
 
-    def get_full_retrieval_name(
-        self, tracker: "DialogueStateTracker"
-    ) -> Optional[Text]:
-        """Returns full retrieval name for the action.
-
-        Extracts retrieval intent from response selector and
-        returns complete action utterance name.
-
-        Args:
-            tracker: Tracker containing past conversation events.
-
-        Returns:
-            Full retrieval name of the action if the last user utterance
-            contains a response selector output, `None` otherwise.
-        """
-        if RESPONSE_SELECTOR_PROPERTY_NAME not in tracker.latest_message.parse_data:
-            return None
-
-        response_selector_properties = tracker.latest_message.parse_data[
-            RESPONSE_SELECTOR_PROPERTY_NAME
-        ]
-
-        if (
-            self.intent_name_from_action(self.action_name)
-            in response_selector_properties
-        ):
-            query_key = self.intent_name_from_action(self.action_name)
-        elif RESPONSE_SELECTOR_DEFAULT_INTENT in response_selector_properties:
-            query_key = RESPONSE_SELECTOR_DEFAULT_INTENT
-        else:
-            return None
-
-        selected = response_selector_properties[query_key]
-        full_retrieval_utter_action = selected[RESPONSE_SELECTOR_PREDICTION_KEY][
-            RESPONSE_SELECTOR_UTTER_ACTION_KEY
-        ]
-        return full_retrieval_utter_action
-
     async def run(
         self,
         output_channel: "OutputChannel",
@@ -400,6 +388,7 @@ class ActionRetrieveResponse(ActionBotResponse):
         domain: "Domain",
     ) -> List[Event]:
         """Query the appropriate response and create a bot utterance with that."""
+
         response_selector_properties = tracker.latest_message.parse_data[
             RESPONSE_SELECTOR_PROPERTY_NAME
         ]
@@ -542,7 +531,7 @@ class ActionSessionStart(Action):
         domain: "Domain",
     ) -> List[Event]:
         """Runs action. Please see parent class for the full docstring."""
-        _events: List[Event] = [SessionStarted(metadata=self.metadata)]
+        _events = [SessionStarted(metadata=self.metadata)]
 
         if domain.session_config.carry_over_slots:
             _events.extend(self._slot_set_events_from_tracker(tracker))
@@ -658,6 +647,17 @@ class RemoteAction(Action):
         bot_messages = []
         for response in responses:
             generated_response = response.pop("response", None)
+            generated_template = response.pop("template", None)
+            if generated_template and not generated_response:
+                generated_response = generated_template
+                rasa.shared.utils.io.raise_deprecation_warning(
+                    "The terminology 'template' is deprecated and replaced by "
+                    "'response', use the `response` parameter instead of "
+                    "`template` in `dispatcher.utter_message`. You can do that "
+                    "by upgrading to Rasa SDK 2.4.1 or adapting your custom SDK.",
+                    docs=f"{rasa.shared.constants.DOCS_BASE_URL_ACTION_SERVER}"
+                    f"/sdk-dispatcher",
+                )
             if generated_response:
                 draft = await nlg.generate(
                     generated_response, tracker, output_channel.name(), **response
@@ -711,7 +711,7 @@ class RemoteAction(Action):
 
             events_json = response.get("events", [])
             responses = response.get("responses", [])
-            bot_messages: List[Event] = await self._utter_responses(
+            bot_messages = await self._utter_responses(
                 responses, output_channel, nlg, tracker
             )
 
